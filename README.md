@@ -4,6 +4,8 @@
 
 A powerful command-line client for querying and analyzing logs from the Tailstream API with an interactive viewer, real-time search, and flexible filtering.
 
+<img width="1158" height="835" alt="image" src="https://github.com/user-attachments/assets/7bb55238-b744-47ce-9788-eb73c5e7ff89" />
+
 ## Quick Start
 
 ```bash
