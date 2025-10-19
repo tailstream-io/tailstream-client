@@ -1,0 +1,7 @@
+dist/
+*.log
+.tailstream-client.yaml
+.DS_Store
+
+
+dist

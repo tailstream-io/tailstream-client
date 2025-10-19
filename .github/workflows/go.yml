@@ -1,0 +1,39 @@
+name: Go
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.23'
+
+    - name: Build
+      run: |
+        cd client
+        go build -v ./...
+
+    - name: Test
+      run: |
+        cd client
+        go test -v ./...
+
+    - name: Build distributables
+      run: ./build.sh
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: tailstream-client-binaries
+        path: dist/
+
+
