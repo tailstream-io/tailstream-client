@@ -26,9 +26,12 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+	"unsafe"
 )
 
 // InteractiveContext holds the context needed for dynamic operations in interactive mode
@@ -51,7 +54,8 @@ func runInteractiveMode(entries []map[string]any, withColor bool, hasMore bool, 
 
 	currentIdx := 0
 	expanded := make(map[int]bool)
-	expandedScrollOffset := make(map[int]int) // Track scroll offset within expanded entries
+	expandedScrollOffset := make(map[int]int)   // Track vertical scroll offset within expanded entries
+	horizontalScrollOffset := make(map[int]int) // Track horizontal scroll offset for each entry
 	loading := false
 	status := ""
 	searchQuery := ""          // Current server-side search query
@@ -84,25 +88,128 @@ func runInteractiveMode(entries []map[string]any, withColor bool, hasMore bool, 
 	runCmd("stty", "-echo", "-icanon")
 	defer runCmd("stty", "echo", "icanon")
 
-	// Get terminal height
+	// Set up signal handling for terminal resize
+	sigwinch := make(chan os.Signal, 1)
+	signal.Notify(sigwinch, syscall.SIGWINCH)
+
+	// Get terminal dimensions using ioctl (more reliable than tput)
+	type winsize struct {
+		Row    uint16
+		Col    uint16
+		Xpixel uint16
+		Ypixel uint16
+	}
+
+	getTerminalSize := func() (int, int) {
+		ws := &winsize{}
+		retCode, _, errno := syscall.Syscall(syscall.SYS_IOCTL,
+			uintptr(syscall.Stdin),
+			uintptr(syscall.TIOCGWINSZ),
+			uintptr(unsafe.Pointer(ws)))
+
+		if int(retCode) == -1 {
+			// Fallback to tput if ioctl fails
+			cmd := exec.Command("tput", "lines")
+			output, err := cmd.Output()
+			height := 40
+			if err == nil {
+				if h, e := strconv.Atoi(strings.TrimSpace(string(output))); e == nil {
+					height = h
+				}
+			}
+
+			cmd = exec.Command("tput", "cols")
+			output, err = cmd.Output()
+			width := 80
+			if err == nil {
+				if w, e := strconv.Atoi(strings.TrimSpace(string(output))); e == nil {
+					width = w
+				}
+			}
+			_ = errno // avoid unused variable
+			return height, width
+		}
+		return int(ws.Row), int(ws.Col)
+	}
+
 	getTerminalHeight := func() int {
-		cmd := exec.Command("tput", "lines")
-		output, err := cmd.Output()
-		if err != nil {
-			return 40 // Default fallback
-		}
-		height, err := strconv.Atoi(strings.TrimSpace(string(output)))
-		if err != nil {
-			return 40
-		}
-		return height
+		h, _ := getTerminalSize()
+		return h
+	}
+
+	getTerminalWidth := func() int {
+		_, w := getTerminalSize()
+		return w
 	}
 
 	termHeight := getTerminalHeight()
-	// Reserve space for header (3 lines) and footer (2 lines)
+	termWidth := getTerminalWidth()
+	// Reserve space for: header (1) + status (1) + separator (1) + separator (1) + footer (1) = 5 lines
+	// The remaining space is for log content
 	viewportHeight := termHeight - 5
-	if viewportHeight < 10 {
-		viewportHeight = 10 // Minimum viewport
+	if viewportHeight < 1 {
+		viewportHeight = 1 // Absolute minimum
+	}
+
+	// Helper to truncate a line to fit terminal width
+	truncateLine := func(line string, maxWidth int) string {
+		if len(line) <= maxWidth {
+			return line
+		}
+		if maxWidth <= 3 {
+			return "..."
+		}
+		return line[:maxWidth-3] + "..."
+	}
+
+	// Helper to extract a horizontal window from a line with scroll offset
+	horizontalWindow := func(line string, offset int, maxWidth int) string {
+		lineLen := len(line)
+
+		// If line fits entirely, no scrolling needed
+		if lineLen <= maxWidth {
+			return line
+		}
+
+		// Clamp offset
+		if offset < 0 {
+			offset = 0
+		}
+		maxOffset := lineLen - maxWidth
+		if maxOffset < 0 {
+			maxOffset = 0
+		}
+		if offset > maxOffset {
+			offset = maxOffset
+		}
+
+		// Extract window
+		end := offset + maxWidth
+		if end > lineLen {
+			end = lineLen
+		}
+
+		result := line[offset:end]
+
+		// Add indicators for scrolled content
+		if offset > 0 && end < lineLen {
+			// Content on both sides - show both indicators
+			if len(result) > 2 {
+				result = "<" + result[1:len(result)-1] + ">"
+			}
+		} else if offset > 0 {
+			// Content on left only
+			if len(result) > 0 {
+				result = "<" + result[1:]
+			}
+		} else if end < lineLen {
+			// Content on right only
+			if len(result) > 0 {
+				result = result[:len(result)-1] + ">"
+			}
+		}
+
+		return result
 	}
 
 	// Forward declare functions
@@ -299,8 +406,28 @@ func runInteractiveMode(entries []map[string]any, withColor bool, hasMore bool, 
 	}
 
 	renderScreen = func() {
-		// Clear screen
-		fmt.Print("\033[2J\033[H")
+		// Update terminal dimensions in case of resize
+		termHeight = getTerminalHeight()
+		termWidth = getTerminalWidth()
+		// Calculate viewport height: we need to reserve exactly 5 lines for UI elements:
+		// - Header line (1)
+		// - Status line (1)
+		// - Top separator (1)
+		// - Bottom separator (1)
+		// - Footer line (1)
+		// Everything else is content
+		viewportHeight = termHeight - 5
+		if viewportHeight < 1 {
+			viewportHeight = 1 // Absolute minimum
+		}
+
+		// Build entire screen content in a buffer to avoid tearing
+		var screen strings.Builder
+
+		// Save cursor, hide cursor, move to home
+		screen.WriteString("\033[?25l")  // Hide cursor
+		screen.WriteString("\033[H")     // Move to top-left
+		screen.WriteString("\033[J")     // Clear from cursor to end
 
 		// Header shows different info for search vs normal mode
 		headerText := ""
@@ -339,11 +466,19 @@ func runInteractiveMode(entries []map[string]any, withColor bool, hasMore bool, 
 			headerText = fmt.Sprintf("Logs (%d loaded%s)%s%s", len(allEntries), totalInfo, dateFilterText, loadingText)
 		}
 
-		fmt.Printf("%s - Use j/k or ↓/↑ to navigate, Space/Enter to expand/collapse, q to quit\n", headerText)
+		// Print header with line truncation
+		headerLine1 := headerText + " - Use j/k or ↓/↑ to navigate, Space/Enter to expand/collapse, q to quit"
+		screen.WriteString(truncateLine(headerLine1, termWidth))
+		screen.WriteString("\033[K\n")  // Clear to end of line
+
 		if status != "" {
-			fmt.Printf("%s\n", style(status, "33", withColor))
+			screen.WriteString(truncateLine(style(status, "33", withColor), termWidth))
 		}
-		fmt.Println(strings.Repeat("─", 80))
+		screen.WriteString("\033[K\n")  // Clear to end of line
+
+		separatorLine := strings.Repeat("─", termWidth)
+		screen.WriteString(separatorLine)
+		screen.WriteString("\033[K\n")  // Clear to end of line
 
 		// Calculate viewport window
 		// Center the current index in the viewport when possible
@@ -369,12 +504,15 @@ func runInteractiveMode(entries []map[string]any, withColor bool, hasMore bool, 
 				cursor = style("▶ ", "36", withColor)
 			}
 
+			// Get horizontal scroll offset for this entry
+			hOffset := horizontalScrollOffset[i]
+
 			if expanded[i] {
 				// Show full JSON when expanded - with scrolling support
 				jsonBytes, _ := json.MarshalIndent(entry, "  ", "  ")
 				jsonLines := strings.Split(string(jsonBytes), "\n")
 
-				// Get scroll offset for this entry
+				// Get vertical scroll offset for this entry
 				scrollOffset := expandedScrollOffset[i]
 				if scrollOffset < 0 {
 					scrollOffset = 0
@@ -384,13 +522,16 @@ func runInteractiveMode(entries []map[string]any, withColor bool, hasMore bool, 
 				}
 				expandedScrollOffset[i] = scrollOffset
 
-				// Render visible portion of expanded JSON
+				// Render visible portion of expanded JSON with horizontal scrolling
 				for lineIdx := scrollOffset; lineIdx < len(jsonLines) && linesRendered < viewportHeight; lineIdx++ {
 					prefix := "  "
 					if lineIdx == scrollOffset {
 						prefix = cursor // Show cursor on first visible line
 					}
-					fmt.Printf("%s%s\n", prefix, jsonLines[lineIdx])
+					line := fmt.Sprintf("%s%s", prefix, jsonLines[lineIdx])
+					// Apply horizontal scrolling
+					screen.WriteString(horizontalWindow(line, hOffset, termWidth))
+					screen.WriteString("\033[0m\033[K\n")  // Reset formatting and clear to end of line
 					linesRendered++
 				}
 
@@ -398,23 +539,27 @@ func runInteractiveMode(entries []map[string]any, withColor bool, hasMore bool, 
 				if scrollOffset > 0 || scrollOffset+linesRendered < len(jsonLines) {
 					scrollInfo := fmt.Sprintf("  [Lines %d-%d of %d]", scrollOffset+1, scrollOffset+linesRendered, len(jsonLines))
 					if linesRendered < viewportHeight {
-						fmt.Println(style(scrollInfo, "90", withColor))
+						screen.WriteString(horizontalWindow(style(scrollInfo, "90", withColor), hOffset, termWidth))
+						screen.WriteString("\033[0m\033[K\n")  // Reset formatting and clear to end of line
 						linesRendered++
 					}
 				}
 			} else {
-				// Show formatted log line
-				fmt.Printf("%s%s\n", cursor, formatEntry(entry, withColor))
+				// Show formatted log line with horizontal scrolling
+				line := fmt.Sprintf("%s%s", cursor, formatEntry(entry, withColor))
+				screen.WriteString(horizontalWindow(line, hOffset, termWidth))
+				screen.WriteString("\033[0m\033[K\n")  // Reset formatting and clear to end of line
 				linesRendered++
 			}
 		}
 
 		// Fill remaining viewport space if needed
 		for i := linesRendered; i < viewportHeight; i++ {
-			fmt.Println()
+			screen.WriteString("\033[K\n")  // Clear empty lines
 		}
 
-		fmt.Println(strings.Repeat("─", 80))
+		screen.WriteString(separatorLine)
+		screen.WriteString("\033[K\n")  // Clear to end of line
 
 		// Footer with navigation info
 		moreInfo := ""
@@ -440,7 +585,16 @@ func runInteractiveMode(entries []map[string]any, withColor bool, hasMore bool, 
 			helpText = "Esc: clear search | f: date filter"
 		}
 
-		fmt.Printf("Entry %d/%d%s%s | %s | Space: expand | q: quit\n", currentIdx+1, len(allEntries), viewportInfo, moreInfo, helpText)
+		footerLine := fmt.Sprintf("Entry %d/%d%s%s | %s | Space: expand | q: quit", currentIdx+1, len(allEntries), viewportInfo, moreInfo, helpText)
+		screen.WriteString(truncateLine(footerLine, termWidth))
+		screen.WriteString("\033[0m\033[K")  // Reset formatting and clear to end of line (NO newline!)
+
+		// Clear any remaining lines below footer to prevent artifacts
+		screen.WriteString("\033[J")  // Clear from cursor to end of screen
+
+		// Show cursor and write entire buffer at once
+		screen.WriteString("\033[?25h")  // Show cursor
+		fmt.Print(screen.String())
 	}
 
 	// Load next page in background when approaching end
@@ -520,6 +674,13 @@ func runInteractiveMode(entries []map[string]any, withColor bool, hasMore bool, 
 	}
 
 	renderScreen()
+
+	// Handle resize signals in background
+	go func() {
+		for range sigwinch {
+			renderScreen()
+		}
+	}()
 
 	// Read input
 	buf := make([]byte, 6)
@@ -611,7 +772,13 @@ func runInteractiveMode(entries []map[string]any, withColor bool, hasMore bool, 
 					renderScreen()
 				} else if currentIdx < len(allEntries)-1 {
 					// At bottom of expanded content, move to next entry
+					oldIdx := currentIdx
 					currentIdx++
+					// Reset horizontal scroll when changing entries
+					if _, exists := horizontalScrollOffset[currentIdx]; !exists {
+						horizontalScrollOffset[currentIdx] = 0
+					}
+					delete(horizontalScrollOffset, oldIdx) // Clean up old entry to save memory
 					if currentIdx >= len(allEntries)-5 && hasNextPage && !loading {
 						loadNextPage()
 					}
@@ -620,7 +787,13 @@ func runInteractiveMode(entries []map[string]any, withColor bool, hasMore bool, 
 			} else {
 				// Normal navigation
 				if currentIdx < len(allEntries)-1 {
+					oldIdx := currentIdx
 					currentIdx++
+					// Reset horizontal scroll when changing entries
+					if _, exists := horizontalScrollOffset[currentIdx]; !exists {
+						horizontalScrollOffset[currentIdx] = 0
+					}
+					delete(horizontalScrollOffset, oldIdx) // Clean up old entry to save memory
 
 					// Auto-load next page when near the end (within 5 entries)
 					if currentIdx >= len(allEntries)-5 && hasNextPage && !loading {
@@ -640,16 +813,69 @@ func runInteractiveMode(entries []map[string]any, withColor bool, hasMore bool, 
 					renderScreen()
 				} else if currentIdx > 0 {
 					// At top of expanded content, move to previous entry
+					oldIdx := currentIdx
 					currentIdx--
+					// Reset horizontal scroll when changing entries
+					if _, exists := horizontalScrollOffset[currentIdx]; !exists {
+						horizontalScrollOffset[currentIdx] = 0
+					}
+					delete(horizontalScrollOffset, oldIdx) // Clean up old entry to save memory
 					renderScreen()
 				}
 			} else {
 				// Normal navigation
 				if currentIdx > 0 {
+					oldIdx := currentIdx
 					currentIdx--
+					// Reset horizontal scroll when changing entries
+					if _, exists := horizontalScrollOffset[currentIdx]; !exists {
+						horizontalScrollOffset[currentIdx] = 0
+					}
+					delete(horizontalScrollOffset, oldIdx) // Clean up old entry to save memory
 					renderScreen()
 				}
 			}
+
+		case n == 3 && input[0] == 27 && input[1] == 91 && input[2] == 67:
+			// Right arrow - scroll right horizontally
+			// Get the actual line content to calculate max offset
+			var lineContent string
+			if expanded[currentIdx] {
+				jsonBytes, _ := json.MarshalIndent(allEntries[currentIdx], "  ", "  ")
+				jsonLines := strings.Split(string(jsonBytes), "\n")
+				if len(jsonLines) > 0 {
+					// Use the longest line in expanded view
+					for _, jsonLine := range jsonLines {
+						if len(jsonLine) > len(lineContent) {
+							lineContent = jsonLine
+						}
+					}
+				}
+			} else {
+				lineContent = fmt.Sprintf("%s%s", style("▶ ", "36", withColor), formatEntry(allEntries[currentIdx], withColor))
+			}
+
+			// Calculate max offset
+			maxOffset := len(lineContent) - termWidth
+			if maxOffset < 0 {
+				maxOffset = 0
+			}
+
+			// Only scroll if we haven't reached the end
+			newOffset := horizontalScrollOffset[currentIdx] + 10
+			if newOffset > maxOffset {
+				newOffset = maxOffset
+			}
+			horizontalScrollOffset[currentIdx] = newOffset
+			renderScreen()
+
+		case n == 3 && input[0] == 27 && input[1] == 91 && input[2] == 68:
+			// Left arrow - scroll left horizontally
+			horizontalScrollOffset[currentIdx] -= 10
+			if horizontalScrollOffset[currentIdx] < 0 {
+				horizontalScrollOffset[currentIdx] = 0
+			}
+			renderScreen()
 
 		case input[0] == 'd' || input[0] == 'D':
 			// Page Down (d key) - jump down by viewport height
